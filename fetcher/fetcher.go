@@ -27,6 +27,56 @@ type Config struct {
 	DownloadTimeout time.Duration
 	// FetchUA is sent with subscription download requests.
 	FetchUA string
+	// DownloadRetries is the number of extra attempts after the first failure
+	// for network-level errors (dial timeout, connection reset, i/o timeout).
+	// Defaults to DefaultDownloadRetries when 0. Set to 1 to disable retrying.
+	DownloadRetries int
+	// RetryBaseDelay is the initial backoff between retries; it doubles each
+	// attempt (capped at RetryMaxDelay) with ±25% jitter. Defaults to
+	// DefaultRetryBaseDelay when 0.
+	RetryBaseDelay time.Duration
+	// RetryMaxDelay caps the backoff between retries. Defaults to
+	// DefaultRetryMaxDelay when 0.
+	RetryMaxDelay time.Duration
+}
+
+const (
+	// DefaultDownloadRetries is the retry count that keeps working on links
+	// where a large share of new connections need several SYN retransmissions
+	// before the handshake completes. Measured on a home PPPoE line where
+	// ~1/3 of connections to overseas CDNs took 5-10s (vs <1s otherwise):
+	// a single attempt failed often enough to lose most sources, while
+	// 4 retries brought every sample through.
+	DefaultDownloadRetries = 4
+	// DefaultRetryBaseDelay is the first backoff step.
+	DefaultRetryBaseDelay = 1 * time.Second
+	// DefaultRetryMaxDelay caps the backoff so a round cannot stall forever.
+	DefaultRetryMaxDelay = 8 * time.Second
+)
+
+func (c *Config) downloadRetries() int {
+	if c.DownloadRetries == 0 {
+		return DefaultDownloadRetries
+	}
+	// Negative means "no retries".
+	if c.DownloadRetries < 0 {
+		return 0
+	}
+	return c.DownloadRetries
+}
+
+func (c *Config) retryBaseDelay() time.Duration {
+	if c.RetryBaseDelay > 0 {
+		return c.RetryBaseDelay
+	}
+	return DefaultRetryBaseDelay
+}
+
+func (c *Config) retryMaxDelay() time.Duration {
+	if c.RetryMaxDelay > 0 {
+		return c.RetryMaxDelay
+	}
+	return DefaultRetryMaxDelay
 }
 
 func (c *Config) parseConcurrency() int {
@@ -139,7 +189,12 @@ func (f *Fetcher) processSources(ctx context.Context, sources []Source) []FetchR
 		jobsCh <- downloadJob{source: s}
 	}
 	close(jobsCh)
-	dlCh := runHTTPWorkers(ctx, jobsCh, f.cfg.HTTPConcurrency, f.cfg.DownloadTimeout, f.cfg.fetchUA())
+	dlCh := runHTTPWorkers(ctx, jobsCh, f.cfg.HTTPConcurrency, f.cfg.DownloadTimeout, f.cfg.fetchUA(),
+		retryConfig{
+			retries:   f.cfg.downloadRetries(),
+			baseDelay: f.cfg.retryBaseDelay(),
+			maxDelay:  f.cfg.retryMaxDelay(),
+		})
 
 	// ── Stage 3: Parse workers (start immediately, before any download done) ──
 	// Small buffer: parse workers pull jobs the moment they arrive.

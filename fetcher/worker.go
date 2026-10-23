@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strings"
@@ -61,6 +62,7 @@ func runHTTPWorkers(
 	concurrency int,
 	downloadTimeout time.Duration,
 	fetchUA string,
+	retry retryConfig,
 ) <-chan downloadResult {
 	out := make(chan downloadResult, concurrency*2)
 	var wg sync.WaitGroup
@@ -76,7 +78,7 @@ func runHTTPWorkers(
 					return
 				default:
 				}
-				bodies, err := fetchSourceBodies(ctx, hc, fetchUA, job.source)
+				bodies, err := fetchSourceBodies(ctx, hc, fetchUA, job.source, retry)
 				select {
 				case out <- downloadResult{source: job.source, bodies: bodies, err: err}:
 				case <-ctx.Done():
@@ -104,7 +106,7 @@ func runHTTPWorkers(
 //
 // Partial failures (some lines fail, others succeed) are logged but not fatal.
 // An error is returned only when every sub-URL fails.
-func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src Source) ([][]byte, error) {
+func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src Source, retry retryConfig) ([][]byte, error) {
 	lines := splitNonEmptyLines(src.Content)
 
 	var fetchURLs []string
@@ -130,7 +132,7 @@ func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src
 
 		case strings.HasPrefix(line, "extract:"):
 			rawURL := strings.TrimSpace(line[len("extract:"):])
-			httpURLs, proxyBody, err := extractURLsFromRemote(ctx, hc, fetchUA, rawURL)
+			httpURLs, proxyBody, err := extractURLsFromRemote(ctx, hc, fetchUA, rawURL, retry)
 			if err != nil {
 				log.Printf("[fetcher] source %s extract %q: %v", src.ID, rawURL, err)
 				continue
@@ -150,7 +152,7 @@ func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src
 	bodies = append(bodies, inlineBodies...)
 
 	for _, u := range fetchURLs {
-		body, err := downloadURL(ctx, hc, fetchUA, u)
+		body, err := downloadURLWithRetry(ctx, hc, fetchUA, u, retry)
 		if err != nil {
 			log.Printf("[fetcher] source %s fetch %q: %v", src.ID, u, err)
 			continue
@@ -168,8 +170,8 @@ func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src
 //   - http(s) URLs are returned as httpURLs (to be fetched as subscriptions).
 //   - proxy-protocol URLs are joined with "\n" and returned as proxyBody
 //     (treated as a URL-list body by the parse stage).
-func extractURLsFromRemote(ctx context.Context, hc *http.Client, fetchUA, rawURL string) (httpURLs []string, proxyBody []byte, err error) {
-	body, fetchErr := downloadURL(ctx, hc, fetchUA, rawURL)
+func extractURLsFromRemote(ctx context.Context, hc *http.Client, fetchUA, rawURL string, retry retryConfig) (httpURLs []string, proxyBody []byte, err error) {
+	body, fetchErr := downloadURLWithRetry(ctx, hc, fetchUA, rawURL, retry)
 	if fetchErr != nil {
 		return nil, nil, fetchErr
 	}
@@ -217,8 +219,118 @@ func DownloadURL(ctx context.Context, rawURL string) ([]byte, error) {
 	return downloadURL(ctx, hc, defaultFetchUA, rawURL)
 }
 
+// retryConfig carries the retry knobs threaded down from Config.
+type retryConfig struct {
+	retries    int
+	baseDelay  time.Duration
+	maxDelay   time.Duration
+}
+
+// backoffFor returns the delay before attempt n (1-based) with ±25% jitter.
+func (r retryConfig) backoffFor(n int) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	d := r.baseDelay
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= r.maxDelay {
+			d = r.maxDelay
+			break
+		}
+	}
+	if d > r.maxDelay {
+		d = r.maxDelay
+	}
+	// Jitter ±25% so concurrent workers do not retry in lockstep.
+	jitter := time.Duration(rand.Int63n(int64(d)/2+1)) - d/4
+	d += jitter
+	if d < 0 {
+		d = 0
+	}
+	return d
+}
+
+// isRetryable reports whether err is a transport-level failure that is worth
+// another attempt. HTTP status errors are deliberately excluded: a 404 or 403
+// will not fix itself, and retrying only wastes a slot in the round.
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"Client.Timeout",
+		"context deadline exceeded",
+		"i/o timeout",
+		"connection timed out",
+		"connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"no route to host",
+		"network is unreachable",
+		"dial tcp",
+		"dial udp",
+		"EOF",
+		"TLS handshake timeout",
+		"server misbehaving",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // downloadURL fetches a URL with the supplied User-Agent.
+//
+// The first failure is retried up to r.retries times with exponential backoff
+// when the error looks like a transport-level problem. DNS failures are also
+// retried because on some lines a burst of queries gets dropped wholesale.
 func downloadURL(ctx context.Context, hc *http.Client, fetchUA, url string) ([]byte, error) {
+	return downloadURLWithRetry(ctx, hc, fetchUA, url, retryConfig{})
+}
+
+func downloadURLWithRetry(ctx context.Context, hc *http.Client, fetchUA, url string, r retryConfig) ([]byte, error) {
+	maxAttempts := r.retries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			// Respect context cancellation while waiting.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(r.backoffFor(attempt - 1)):
+			}
+		}
+
+		body, err := downloadOnce(ctx, hc, fetchUA, url)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("[fetcher] %q succeeded on attempt %d/%d", url, attempt, maxAttempts)
+			}
+			return body, nil
+		}
+		lastErr = err
+
+		// Do not burn remaining attempts on errors that cannot recover.
+		if !isRetryable(err) {
+			return nil, err
+		}
+		if attempt < maxAttempts {
+			log.Printf("[fetcher] %q attempt %d/%d failed: %v — retrying",
+				url, attempt, maxAttempts, err)
+		}
+	}
+	return nil, lastErr
+}
+
+// downloadOnce performs a single fetch attempt.
+func downloadOnce(ctx context.Context, hc *http.Client, fetchUA, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
