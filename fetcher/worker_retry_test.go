@@ -41,7 +41,7 @@ func TestDownloadURL_RetriesTransientErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	body, err := downloadURLWithRetry(context.Background(), srv.Client(),
+	body, _, err := downloadURLWithRetry(context.Background(), srv.Client(),
 		"ua", srv.URL, newRetry(4))
 	if err != nil {
 		t.Fatalf("expected success after retries, got %v", err)
@@ -64,7 +64,7 @@ func TestDownloadURL_NoRetryOnHTTPStatus(t *testing.T) {
 			w.WriteHeader(code)
 		}))
 
-		_, err := downloadURLWithRetry(context.Background(), srv.Client(),
+		_, _, err := downloadURLWithRetry(context.Background(), srv.Client(),
 			"ua", srv.URL, newRetry(4))
 		if err == nil {
 			t.Fatalf("code %d: expected error", code)
@@ -91,7 +91,7 @@ func TestDownloadURL_ExhaustsRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := downloadURLWithRetry(context.Background(), srv.Client(),
+	_, _, err := downloadURLWithRetry(context.Background(), srv.Client(),
 		"ua", srv.URL, newRetry(3))
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
@@ -112,7 +112,7 @@ func TestDownloadURL_ZeroRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := downloadURLWithRetry(context.Background(), srv.Client(),
+	_, _, err := downloadURLWithRetry(context.Background(), srv.Client(),
 		"ua", srv.URL, newRetry(0))
 	if err == nil {
 		t.Fatal("expected error")
@@ -223,7 +223,7 @@ func TestDownloadURL_ContextCancelled(t *testing.T) {
 	// Large backoff so the test would time out if the loop ignored ctx.
 	r := retryConfig{retries: 5, baseDelay: 10 * time.Second, maxDelay: 10 * time.Second}
 	start := time.Now()
-	_, err := downloadURLWithRetry(ctx, srv.Client(), "ua", srv.URL, r)
+	_, _, err := downloadURLWithRetry(ctx, srv.Client(), "ua", srv.URL, r)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -234,3 +234,4 @@ func TestDownloadURL_ContextCancelled(t *testing.T) {
 		t.Fatalf("calls = %d, want 1", got)
 	}
 }
+

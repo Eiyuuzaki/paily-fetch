@@ -237,7 +237,7 @@ func (f *Fetcher) processSources(ctx context.Context, sources []Source) []FetchR
 				}
 			} else {
 				select {
-				case parseJobsCh <- processJob{source: dr.source, bodies: dr.bodies}:
+				case parseJobsCh <- processJob{source: dr.source, bodies: dr.bodies, userinfo: dr.userinfo}:
 				case <-ctx.Done():
 					return
 				}
@@ -264,6 +264,7 @@ func (f *Fetcher) processSources(ctx context.Context, sources []Source) []FetchR
 			Success:   true,
 			NodeCount: &count,
 			Nodes:     clashMaps,
+			UsageInfo: parseUserinfo(pr.userinfo),
 		})
 	}
 

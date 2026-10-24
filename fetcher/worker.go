@@ -24,23 +24,26 @@ type downloadJob struct {
 
 // downloadResult carries all collected response bodies (or error) for a source.
 type downloadResult struct {
-	source Source
-	bodies [][]byte // one entry per successfully fetched sub-URL
-	err    error
+	source   Source
+	bodies   [][]byte // one entry per successfully fetched sub-URL
+	userinfo string   // Subscription-Userinfo header from the first response that had one
+	err      error
 }
 
 // processJob carries one or more response bodies to CPU-bound parse workers.
 // For "node" sources bodies is nil; the parse worker reads source.Content directly.
 type processJob struct {
-	source Source
-	bodies [][]byte
+	source   Source
+	bodies   [][]byte
+	userinfo string
 }
 
 // processResult carries parsed nodes back from parse workers.
 type processResult struct {
-	source Source
-	nodes  []*node.ProxyNode
-	err    error
+	source   Source
+	nodes    []*node.ProxyNode
+	userinfo string
+	err      error
 }
 
 // proxyLinkRe matches non-HTTP proxy-protocol URLs embedded anywhere in text.
@@ -78,9 +81,9 @@ func runHTTPWorkers(
 					return
 				default:
 				}
-				bodies, err := fetchSourceBodies(ctx, hc, fetchUA, job.source, retry)
+				bodies, userinfo, err := fetchSourceBodies(ctx, hc, fetchUA, job.source, retry)
 				select {
-				case out <- downloadResult{source: job.source, bodies: bodies, err: err}:
+				case out <- downloadResult{source: job.source, bodies: bodies, userinfo: userinfo, err: err}:
 				case <-ctx.Done():
 					return
 				}
@@ -106,11 +109,17 @@ func runHTTPWorkers(
 //
 // Partial failures (some lines fail, others succeed) are logged but not fatal.
 // An error is returned only when every sub-URL fails.
-func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src Source, retry retryConfig) ([][]byte, error) {
+//
+// The second return value is the Subscription-Userinfo header captured from
+// the first sub-URL response that carried one ("" when none did). For
+// multi-URL sources the header of the first successful response wins —
+// headers across different providers are not mergeable anyway.
+func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src Source, retry retryConfig) ([][]byte, string, error) {
 	lines := splitNonEmptyLines(src.Content)
 
 	var fetchURLs []string
 	var inlineBodies [][]byte // pre-assembled bodies from extract: proxy links
+	var userinfo string
 
 	for _, line := range lines {
 		switch {
@@ -152,18 +161,21 @@ func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src
 	bodies = append(bodies, inlineBodies...)
 
 	for _, u := range fetchURLs {
-		body, err := downloadURLWithRetry(ctx, hc, fetchUA, u, retry)
+		body, ui, err := downloadURLWithRetry(ctx, hc, fetchUA, u, retry)
 		if err != nil {
 			log.Printf("[fetcher] source %s fetch %q: %v", src.ID, u, err)
 			continue
+		}
+		if userinfo == "" {
+			userinfo = ui
 		}
 		bodies = append(bodies, body)
 	}
 
 	if len(bodies) == 0 && totalAttempts > 0 {
-		return nil, fmt.Errorf("all %d fetch attempt(s) failed", totalAttempts)
+		return nil, "", fmt.Errorf("all %d fetch attempt(s) failed", totalAttempts)
 	}
-	return bodies, nil
+	return bodies, userinfo, nil
 }
 
 // extractURLsFromRemote fetches rawURL and scans the response body for URLs:
@@ -171,7 +183,7 @@ func fetchSourceBodies(ctx context.Context, hc *http.Client, fetchUA string, src
 //   - proxy-protocol URLs are joined with "\n" and returned as proxyBody
 //     (treated as a URL-list body by the parse stage).
 func extractURLsFromRemote(ctx context.Context, hc *http.Client, fetchUA, rawURL string, retry retryConfig) (httpURLs []string, proxyBody []byte, err error) {
-	body, fetchErr := downloadURLWithRetry(ctx, hc, fetchUA, rawURL, retry)
+	body, _, fetchErr := downloadURLWithRetry(ctx, hc, fetchUA, rawURL, retry)
 	if fetchErr != nil {
 		return nil, nil, fetchErr
 	}
@@ -288,10 +300,11 @@ func isRetryable(err error) bool {
 // when the error looks like a transport-level problem. DNS failures are also
 // retried because on some lines a burst of queries gets dropped wholesale.
 func downloadURL(ctx context.Context, hc *http.Client, fetchUA, url string) ([]byte, error) {
-	return downloadURLWithRetry(ctx, hc, fetchUA, url, retryConfig{})
+	body, _, err := downloadURLWithRetry(ctx, hc, fetchUA, url, retryConfig{})
+	return body, err
 }
 
-func downloadURLWithRetry(ctx context.Context, hc *http.Client, fetchUA, url string, r retryConfig) ([]byte, error) {
+func downloadURLWithRetry(ctx context.Context, hc *http.Client, fetchUA, url string, r retryConfig) ([]byte, string, error) {
 	maxAttempts := r.retries + 1
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -303,54 +316,55 @@ func downloadURLWithRetry(ctx context.Context, hc *http.Client, fetchUA, url str
 			// Respect context cancellation while waiting.
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			case <-time.After(r.backoffFor(attempt - 1)):
 			}
 		}
 
-		body, err := downloadOnce(ctx, hc, fetchUA, url)
+		body, userinfo, err := downloadOnce(ctx, hc, fetchUA, url)
 		if err == nil {
 			if attempt > 1 {
 				log.Printf("[fetcher] %q succeeded on attempt %d/%d", url, attempt, maxAttempts)
 			}
-			return body, nil
+			return body, userinfo, nil
 		}
 		lastErr = err
 
 		// Do not burn remaining attempts on errors that cannot recover.
 		if !isRetryable(err) {
-			return nil, err
+			return nil, "", err
 		}
 		if attempt < maxAttempts {
 			log.Printf("[fetcher] %q attempt %d/%d failed: %v — retrying",
 				url, attempt, maxAttempts, err)
 		}
 	}
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
-// downloadOnce performs a single fetch attempt.
-func downloadOnce(ctx context.Context, hc *http.Client, fetchUA, url string) ([]byte, error) {
+// downloadOnce performs a single fetch attempt. The second return value is
+// the subscription-userinfo response header ("" when the server omits it).
+func downloadOnce(ctx context.Context, hc *http.Client, fetchUA, url string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, "", fmt.Errorf("build request: %w", err)
 	}
 	if fetchUA != "" {
 		req.Header.Set("User-Agent", fetchUA)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32 MB cap
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, "", fmt.Errorf("read body: %w", err)
 	}
-	return body, nil
+	return body, resp.Header.Get("Subscription-Userinfo"), nil
 }
 
 // runParseWorkers launches concurrency parse workers that consume processJobs and emit processResults.
@@ -386,7 +400,7 @@ func runParseWorkers(
 				}
 
 				select {
-				case out <- processResult{source: job.source, nodes: validNodes, err: err}:
+				case out <- processResult{source: job.source, nodes: validNodes, userinfo: job.userinfo, err: err}:
 				case <-ctx.Done():
 					return
 				}

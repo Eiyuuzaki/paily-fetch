@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -50,6 +53,53 @@ type FetchResult struct {
 	Success   bool             `json:"success"`
 	NodeCount *int             `json:"node_count,omitempty"`
 	Nodes     []map[string]any `json:"nodes,omitempty"`
+	UsageInfo *UsageInfo       `json:"usage_info,omitempty"`
+}
+
+// UsageInfo mirrors the subscription-userinfo header of the source's
+// subscription response. Nil when the source sent no such header (free
+// GitHub / TG sources) — the core API treats nil as "keep previous value".
+type UsageInfo struct {
+	Upload   int64 `json:"upload"`
+	Download int64 `json:"download"`
+	Total    int64 `json:"total"`
+	Expire   int64 `json:"expire"`
+}
+
+// userinfoKeyRe matches key=value pairs inside a subscription-userinfo
+// header value, e.g. "upload=1; download=2; total=3; expire=1735689600".
+var userinfoKeyRe = regexp.MustCompile(`(?i)(upload|download|total|expire)\s*=\s*(\d+)`)
+
+// parseUserinfo converts a subscription-userinfo header value into UsageInfo.
+// Returns nil when the header is empty or no recognisable keys are present,
+// which the core API interprets as "no quota information available".
+func parseUserinfo(header string) *UsageInfo {
+	if header == "" {
+		return nil
+	}
+	ui := &UsageInfo{}
+	found := false
+	for _, m := range userinfoKeyRe.FindAllStringSubmatch(header, -1) {
+		v, err := strconv.ParseInt(m[2], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.ToLower(m[1]) {
+		case "upload":
+			ui.Upload = v
+		case "download":
+			ui.Download = v
+		case "total":
+			ui.Total = v
+		case "expire":
+			ui.Expire = v
+		}
+		found = true
+	}
+	if !found {
+		return nil
+	}
+	return ui
 }
 
 type fetchResultsRequest struct {
