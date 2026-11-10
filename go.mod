@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	filippo.io/age v1.1.1 // indirect
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect
 	github.com/Yawning/aez v0.0.0-20211027044916-e49e68abd344 // indirect
 	github.com/andybalholm/brotli v1.0.6 // indirect
