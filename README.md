@@ -1,4 +1,30 @@
-# Paily Fetch
+# Paily Fetch — Paily ON NAS
+
+> **Paily ON NAS 自托管平台的抓取服务。**
+> 从主仓 `paily-core` 获取来源，下载订阅、解析内容、校验节点后把有效节点上报。
+
+本仓库是 [Paily ON NAS](https://github.com/Eiyuuzaki/Paily-ON-NAS) 的抓取组件，基于 Paily Connect 已开源的 `paily-fetch` 继续维护（AGPL-3.0）。本分支基本沿用上游，仅供个人学习自用。
+
+![Platform](https://img.shields.io/badge/platform-linux%2Farm64-blue) ![Go](https://img.shields.io/badge/Go-1.24%2B-00ADD8) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
+
+## 在 Paily ON NAS 中的位置
+
+```text
+   订阅源 / 散源
+        │
+        ▼
+   Paily 抓取 (paily-fetch)      下载 · 识别 · 解析 · 校验
+        │
+        ▼
+   Paily 主服务 (paily-core)     源库 · 节点池 · 去重 · 分发
+```
+
+用法与原仓库一致，见下方原仓库 README。
+
+---
+
+## 原仓库 README（Paily Connect 上游 `paily-fetch`）
+
 
 > [!IMPORTANT]
 > **本仓库为 Paily Connect 开源仓库的一部分**
