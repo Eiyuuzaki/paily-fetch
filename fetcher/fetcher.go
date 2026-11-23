@@ -38,6 +38,13 @@ type Config struct {
 	// RetryMaxDelay caps the backoff between retries. Defaults to
 	// DefaultRetryMaxDelay when 0.
 	RetryMaxDelay time.Duration
+	// RoundTimeout bounds a single round. A round that hangs (a stalled DNS
+	// lookup inside the container resolver, a worker wedged on a half-open
+	// socket) used to eat the whole interval and make the loop look dead: on
+	// 2026-11-23 the daemon logged "round done" and then nothing for 67
+	// minutes, with no crash and no error. Abandoning the round is the exit
+	// condition for that failure mode. Defaults to DefaultRoundTimeout when 0.
+	RoundTimeout time.Duration
 }
 
 const (
@@ -52,6 +59,10 @@ const (
 	DefaultRetryBaseDelay = 1 * time.Second
 	// DefaultRetryMaxDelay caps the backoff so a round cannot stall forever.
 	DefaultRetryMaxDelay = 8 * time.Second
+	// DefaultRoundTimeout is well above a healthy round (seconds) and well
+	// below the default 3h interval, so an abandoned round still leaves room
+	// for the next tick to start on time.
+	DefaultRoundTimeout = 15 * time.Minute
 )
 
 func (c *Config) downloadRetries() int {
@@ -86,6 +97,13 @@ func (c *Config) parseConcurrency() int {
 	return runtime.NumCPU()
 }
 
+func (c *Config) roundTimeout() time.Duration {
+	if c.RoundTimeout > 0 {
+		return c.RoundTimeout
+	}
+	return DefaultRoundTimeout
+}
+
 func (c *Config) fetchUA() string {
 	if c.FetchUA != "" {
 		return c.FetchUA
@@ -113,7 +131,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 		f.cfg.FetchInterval, f.cfg.HTTPConcurrency, f.cfg.parseConcurrency())
 
 	// Run once immediately, then on each tick.
-	f.runOnce(ctx)
+	f.runRound(ctx)
 
 	ticker := time.NewTicker(f.cfg.FetchInterval)
 	defer ticker.Stop()
@@ -123,8 +141,36 @@ func (f *Fetcher) Run(ctx context.Context) {
 			log.Println("[fetcher] context cancelled — stopping")
 			return
 		case <-ticker.C:
-			f.runOnce(ctx)
+			f.runRound(ctx)
 		}
+	}
+}
+
+// runRound wraps runOnce in a deadline and always logs the outcome, so a
+// stalled round is visible in the log instead of silently swallowing the
+// interval. The goroutine is cancelled through roundCtx rather than leaked:
+// every HTTP call in the pipeline is ctx-aware.
+func (f *Fetcher) runRound(ctx context.Context) {
+	timeout := f.cfg.roundTimeout()
+	roundCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.runOnce(roundCtx)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("[fetcher] round clock — elapsed %s", time.Since(start).Round(time.Millisecond))
+	case <-roundCtx.Done():
+		if ctx.Err() != nil {
+			log.Println("[fetcher] context cancelled during round — stopping")
+			return
+		}
+		log.Printf("[fetcher] round exceeded %s — abandoning it, next tick starts clean", timeout)
 	}
 }
 
@@ -150,13 +196,24 @@ func (f *Fetcher) runOnce(ctx context.Context) {
 		return
 	}
 
-	var nodesTotal int
+	var nodesTotal, okSources, failedSources, emptySources int
 	for _, r := range results {
 		if r.Success && r.NodeCount != nil {
 			nodesTotal += *r.NodeCount
+			if *r.NodeCount > 0 {
+				okSources++
+			} else {
+				emptySources++
+			}
+		} else {
+			failedSources++
 		}
 	}
-	log.Printf("[fetcher] round done — posted %d results, total nodes %d", len(results), nodesTotal)
+	// ok + empty + failed always equals the posted count: an empty source used
+	// to be indistinguishable from a healthy one here, which is how a source
+	// feeding zero nodes for a whole day went unnoticed.
+	log.Printf("[fetcher] round done — posted %d results, total nodes %d (ok=%d empty=%d failed=%d)",
+		len(results), nodesTotal, okSources, emptySources, failedSources)
 }
 
 // processSources runs a fully pipelined download → parse → collect flow.

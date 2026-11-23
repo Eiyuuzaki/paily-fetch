@@ -13,6 +13,7 @@
 //	                        set 0 or -1 to disable)
 //	RETRY_BASE_DELAY        First retry backoff in seconds (default: 1)
 //	RETRY_MAX_DELAY         Backoff cap in seconds (default: 8)
+//	FETCH_ROUND_TIMEOUT     Abandon a round after this many seconds (default: 900)
 package main
 
 import (
@@ -24,6 +25,11 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+	// Embedded tzdata so TZ=Asia/Shanghai actually takes effect: the runtime
+	// image is plain alpine (no /usr/share/zoneinfo), so without this the
+	// daemon logs UTC while every other service logs UTC+8 — on 2026-11-23 that
+	// mismatch turned a 14:21Z round into "21:14" and cost a whole detour.
+	_ "time/tzdata"
 
 	"github.com/openpaily/paily-fetch/fetcher"
 )
@@ -40,6 +46,7 @@ func main() {
 		DownloadRetries:  envIntSigned("DOWNLOAD_RETRIES", fetcher.DefaultDownloadRetries),
 		RetryBaseDelay:   envDuration("RETRY_BASE_DELAY", 1),
 		RetryMaxDelay:    envDuration("RETRY_MAX_DELAY", 8),
+		RoundTimeout:     envDuration("FETCH_ROUND_TIMEOUT", 900),
 	}
 
 	f := fetcher.New(cfg)
